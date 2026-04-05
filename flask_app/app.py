@@ -1,12 +1,21 @@
 from flask import Flask, request, jsonify
 from celery import Celery
 import os
+import uuid
 from flask_cors import CORS
+from flask_jwt_extended import (
+    JWTManager, create_access_token, jwt_required, get_jwt_identity
+)
+from werkzeug.security import generate_password_hash, check_password_hash
 
 app = Flask(__name__)
-CORS(app, origins=["http://localhost:3000"])
+CORS(app, origins=["http://localhost:3000"], supports_credentials=True)
 
 app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB limit
+app.config['JWT_SECRET_KEY'] = os.environ.get('JWT_SECRET_KEY', 'super-secret-change-in-prod')
+app.config['JWT_ACCESS_TOKEN_EXPIRES'] = False  # tokens don't expire (adjust if needed)
+
+jwt = JWTManager(app)
 
 BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0")
 RESULT_BACKEND = os.environ.get("CELERY_RESULT_BACKEND", "redis://localhost:6379/0")
@@ -15,10 +24,84 @@ celery = Celery(app.name, broker=BROKER_URL, backend=RESULT_BACKEND)
 
 UPLOAD_FOLDER = "/uploads"
 
+# ---------------------------------------------------------------------------
+# In-memory user store  {email -> {id, name, email, password_hash}}
+# Resets on server restart — fine for a PBL/demo project
+# ---------------------------------------------------------------------------
+_users: dict = {}
 
 
+# ---------------------------------------------------------------------------
+# Auth routes
+# ---------------------------------------------------------------------------
+
+@app.route("/auth/register", methods=["POST"])
+def auth_register():
+    data = request.get_json(silent=True) or {}
+    name = (data.get("name") or "").strip()
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+
+    if not name or not email or not password:
+        return jsonify({"error": "name, email and password are required"}), 400
+    if len(password) < 8:
+        return jsonify({"error": "Password must be at least 8 characters"}), 400
+    if email in _users:
+        return jsonify({"error": "Email already registered"}), 409
+
+    user_id = str(uuid.uuid4())
+    _users[email] = {
+        "id": user_id,
+        "name": name,
+        "email": email,
+        "password_hash": generate_password_hash(password),
+    }
+    token = create_access_token(identity=user_id, additional_claims={"email": email, "name": name})
+    return jsonify({
+        "token": token,
+        "user": {"id": user_id, "email": email, "name": name},
+    }), 201
+
+
+@app.route("/auth/login", methods=["POST"])
+def auth_login():
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    password = data.get("password") or ""
+
+    user = _users.get(email)
+    if not user or not check_password_hash(user["password_hash"], password):
+        return jsonify({"error": "Invalid email or password"}), 401
+
+    token = create_access_token(
+        identity=user["id"],
+        additional_claims={"email": user["email"], "name": user["name"]},
+    )
+    return jsonify({
+        "token": token,
+        "user": {"id": user["id"], "email": user["email"], "name": user["name"]},
+    })
+
+
+@app.route("/auth/me", methods=["GET"])
+@jwt_required()
+def auth_me():
+    user_id = get_jwt_identity()
+    # Find user by id
+    user = next((u for u in _users.values() if u["id"] == user_id), None)
+    if not user:
+        return jsonify({"error": "User not found"}), 404
+    return jsonify({"id": user["id"], "email": user["email"], "name": user["name"]})
+
+
+
+
+# ---------------------------------------------------------------------------
+# Contract routes  (protected — require a valid JWT Bearer token)
+# ---------------------------------------------------------------------------
 
 @app.route("/upload", methods=["POST"])
+@jwt_required()
 def upload():
     # Check a file was actually sent
     if "file" not in request.files:
