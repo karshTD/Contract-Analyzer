@@ -23,8 +23,10 @@ def load_rag():
 def generate_risk_report(filename, chunks, flagged_clauses, stress_analysis, loan_stats):
     """
     Layer 7 — AI Orchestrator
-    Takes all pipeline outputs and generates a human-readable risk report
+    Takes all pipeline outputs and generates a structured JSON risk report.
+    Returns a tuple: (raw_text_str, parsed_dict_or_None)
     """
+    import json
     from groq import Groq
 
     client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
@@ -44,41 +46,98 @@ def generate_risk_report(filename, chunks, flagged_clauses, stress_analysis, loa
         for s in stress_analysis
     ])
 
-    prompt = f"""You are a financial contract risk analyst. Analyze this loan contract and generate a clear risk report.
+    high_stress_pct = loan_stats.get('high_stress_rate', 0)
+    avg_emi_high    = loan_stats.get('avg_emi_high_stress', 0)
+    avg_emi_low     = loan_stats.get('avg_emi_low_stress', 0)
+
+    system_prompt = (
+        "You are a senior financial contract risk analyst specialising in Indian loan agreements. "
+        "You help ordinary borrowers understand their rights under the RBI Guidelines on Fair Practices Code, "
+        "the Consumer Protection Act 2019, and the SARFAESI Act. "
+        "Respond ONLY with valid JSON — no markdown fences, no backticks, no preamble, no explanation outside the JSON object. "
+        "Currency is always Indian Rupees (₹). Use Indian legal references, not American ones."
+    )
+
+    user_prompt = f"""Analyze this Indian loan contract and return a JSON risk report.
 
 CONTRACT FILE: {filename}
 TOTAL CLAUSES ANALYZED: {len(chunks)}
 
 FLAGGED CLAUSES (matched against {loan_stats.get('total_loans', 0)} historical complaints):
-{flagged_summary}
+{flagged_summary if flagged_summary else "No flagged clauses found."}
 
 FINANCIAL STRESS DATA:
 - Total loans in database: {loan_stats.get('total_loans', 0)}
-- High stress rate: {loan_stats.get('high_stress_rate', 0)}%
-- Avg EMI high stress borrowers: ₹{loan_stats.get('avg_emi_high_stress', 0)}
-- Avg EMI low stress borrowers: ₹{loan_stats.get('avg_emi_low_stress', 0)}
+- High stress rate: {high_stress_pct}%
+- Avg EMI high stress borrowers: ₹{avg_emi_high}
+- Avg EMI low stress borrowers: ₹{avg_emi_low}
 
 STRESS ANALYSIS PER CLAUSE:
-{stress_summary}
+{stress_summary if stress_summary else "No stress data available."}
 
-Generate a structured risk report with:
-1. Overall risk level (LOW/MEDIUM/HIGH/CRITICAL)
-2. Top 3 most dangerous clauses with plain English explanation
-3. Financial stress assessment
-4. Specific recommendations for the borrower
-5. Sections to negotiate or reject
+Return ONLY this JSON structure (fill every field, keep language plain and non-technical):
 
-Be direct, clear, and write for someone who is not a lawyer.
-Keep the report under 400 words."""
+{{
+  "overall_risk_level": "HIGH" | "MEDIUM" | "LOW",
+  "summary": "<one paragraph plain-English summary of the overall contract risk>",
+  "top_dangerous_clauses": [
+    {{
+      "title": "<short clause name>",
+      "description": "<what this clause says in plain language>",
+      "impact": "<why this is dangerous for the borrower>",
+      "severity": "HIGH" | "MEDIUM" | "LOW"
+    }}
+  ],
+  "financial_stress_assessment": {{
+    "high_stress_percentage": {high_stress_pct},
+    "high_stress_avg_emi": {avg_emi_high},
+    "low_stress_avg_emi": {avg_emi_low},
+    "interpretation": "<plain English explanation of what these numbers mean for this borrower>"
+  }},
+  "recommendations": [
+    "<specific action the borrower should take>"
+  ],
+  "sections_to_negotiate": [
+    {{
+      "clause": "<clause name>",
+      "action": "<specific negotiation action>"
+    }}
+  ],
+  "borrower_rights": [
+    "<specific right under Indian law (RBI guidelines / Consumer Protection Act 2019 / SARFAESI Act)>"
+  ]
+}}"""
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=1000
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+        temperature=0.2,
+        max_tokens=1500
     )
 
-    return response.choices[0].message.content
+    raw_text = response.choices[0].message.content
+
+    # ── Parse JSON; fall back gracefully on failure ─────────────
+    try:
+        # Strip accidental markdown fences the model may still add
+        cleaned = raw_text.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("```", 2)[1]
+            if cleaned.startswith("json"):
+                cleaned = cleaned[4:]
+            cleaned = cleaned.rsplit("```", 1)[0].strip()
+        structured = json.loads(cleaned)
+    except (json.JSONDecodeError, ValueError, IndexError) as exc:
+        print(f"[Worker] JSON parse failed ({exc}); using plain text fallback.")
+        structured = {
+            "overall_risk_level": "UNKNOWN",
+            "summary": raw_text,
+        }
+
+    return raw_text, structured
 
 
 @celery.task(name="tasks.process_document")
@@ -185,11 +244,12 @@ def process_document(filepath: str) -> dict:
         print(f"[Worker] MCP server unavailable: {e}")
         loan_stats = {}
 
-    # ── Stage 6: Generate AI Risk Report ───────────────────────────
+    # ── Stage 6: Generate AI Risk Report ───────────────────────────────────────
     print("[Worker] Running Stage 6: Generating AI risk report...")
     risk_report = ""
+    risk_report_structured = None
     try:
-        risk_report = generate_risk_report(
+        risk_report, risk_report_structured = generate_risk_report(
             filename=filename,
             chunks=chunks,
             flagged_clauses=flagged_clauses,
@@ -200,8 +260,12 @@ def process_document(filepath: str) -> dict:
     except Exception as e:
         print(f"[Worker] Risk report generation failed: {e}")
         risk_report = "Risk report generation failed. Please try again."
+        risk_report_structured = {
+            "overall_risk_level": "UNKNOWN",
+            "summary": risk_report,
+        }
 
-    # ── Return final result ─────────────────────────────────────────
+    # ── Return final result ─────────────────────────────────────
     return {
         "filename": filename,
         "status": "complete",
@@ -212,5 +276,6 @@ def process_document(filepath: str) -> dict:
         "loan_stats": loan_stats,
         "rag_available": rag_available,
         "risk_report": risk_report,
+        "risk_report_structured": risk_report_structured,
         "message": "Analysis complete."
     }

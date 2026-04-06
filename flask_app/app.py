@@ -204,13 +204,20 @@ def status(task_id):
                 "matched_complaint": c.get("matched_complaint", ""),
             })
         risk_report = result.get("risk_report", "")
+        risk_report_structured = result.get("risk_report_structured")
+        # Prefer the structured level; fall back to text scan
+        if risk_report_structured and risk_report_structured.get("overall_risk_level") not in (None, "UNKNOWN"):
+            risk_level = risk_report_structured["overall_risk_level"]
+        else:
+            risk_level = _extract_risk_level(risk_report)
         response = {
             "status": "complete",
             "stage": 6,
             "stage_name": STAGE_NAMES[6],
             "flagged_clauses": normalised,
             "risk_report": risk_report,
-            "risk_level": _extract_risk_level(risk_report),
+            "risk_report_structured": risk_report_structured,
+            "risk_level": risk_level,
             # Keep original fields for backward compat with CRA frontend
             "total_chunks": result.get("total_chunks"),
             "loan_stats": result.get("loan_stats"),
