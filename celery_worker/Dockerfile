@@ -11,9 +11,13 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /app
 
 COPY requirements.txt .
+
 RUN pip install --no-cache-dir --timeout=120 torch --extra-index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir --timeout=120 -r requirements.txt
 
 COPY . .
+
+RUN mkdir -p /app/faiss_data /app/uploads
+
 
 CMD ["celery", "-A", "tasks", "worker", "--loglevel=info"]

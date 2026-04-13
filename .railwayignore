@@ -1,0 +1,7 @@
+data/
+project-idea/
+*.csv
+venv/
+.venv/
+__pycache__/
+frontend/

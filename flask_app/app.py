@@ -87,13 +87,10 @@ def auth_login():
 @jwt_required()
 def auth_me():
     user_id = get_jwt_identity()
-    # Find user by id
     user = next((u for u in _users.values() if u["id"] == user_id), None)
     if not user:
         return jsonify({"error": "User not found"}), 404
     return jsonify({"id": user["id"], "email": user["email"], "name": user["name"]})
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +100,6 @@ def auth_me():
 @app.route("/upload", methods=["POST"])
 @jwt_required()
 def upload():
-    # Check a file was actually sent
     if "file" not in request.files:
         return jsonify({"error": "No file provided"}), 400
 
@@ -115,17 +111,44 @@ def upload():
     if not file.filename.endswith(".pdf"):
         return jsonify({"error": "Only PDF files accepted"}), 400
 
-    # Save the PDF to the shared uploads folder
     filepath = os.path.join(UPLOAD_FOLDER, file.filename)
     file.save(filepath)
 
-    # Fire the Celery task with the saved filepath
-    task = celery.send_task("tasks.process_document", args=[filepath])
+    # Read financial profile fields sent by the frontend form.
+    # Safe defaults ensure the task never crashes when fields are absent.
+    def _int(key, default):
+        try:
+            return int(request.form.get(key, default))
+        except (ValueError, TypeError):
+            return default
+
+    def _float(key, default):
+        try:
+            return float(request.form.get(key, default))
+        except (ValueError, TypeError):
+            return default
+
+    financial_profile = {
+        "age":             _int("age", 35),
+        "income":          _float("income", 50000),
+        "loan_amount":     _float("loan_amount", 500000),
+        "emi_amount":      _float("emi_amount", 11000),
+        "tenure_months":   _int("tenure_months", 60),
+        "credit_score":    _int("credit_score", 700),
+        "employment_type": request.form.get("employment_type", "Salaried"),
+        "loan_type":       request.form.get("loan_type", "Personal Loan"),
+    }
+
+    task = celery.send_task(
+        "tasks.process_document",
+        args=[filepath],
+        kwargs={"financial_profile": financial_profile},
+    )
 
     return jsonify({
         "message": "File received. Processing started.",
         "task_id": task.id,
-        "filename": file.filename
+        "filename": file.filename,
     }), 202
 
 
@@ -139,7 +162,6 @@ STAGE_NAMES = {
 }
 
 def _infer_stage(result):
-    """Infer processing stage from partial result data."""
     if not result:
         return 1
     if result.get("risk_report"):
@@ -155,7 +177,6 @@ def _infer_stage(result):
     return 1
 
 def _extract_risk_level(report):
-    """Extract HIGH/MEDIUM/LOW from the risk report text."""
     if not report:
         return None
     upper = report.upper()
@@ -195,7 +216,6 @@ def status(task_id):
     elif task.state == "SUCCESS":
         result = task.result or {}
         flagged = result.get("flagged_clauses", [])
-        # Normalise clause field names: backend may use contract_chunk, frontend expects clause
         normalised = []
         for c in flagged:
             normalised.append({
@@ -205,7 +225,6 @@ def status(task_id):
             })
         risk_report = result.get("risk_report", "")
         risk_report_structured = result.get("risk_report_structured")
-        # Prefer the structured level; fall back to text scan
         if risk_report_structured and risk_report_structured.get("overall_risk_level") not in (None, "UNKNOWN"):
             risk_level = risk_report_structured["overall_risk_level"]
         else:
@@ -218,7 +237,6 @@ def status(task_id):
             "risk_report": risk_report,
             "risk_report_structured": risk_report_structured,
             "risk_level": risk_level,
-            # Keep original fields for backward compat with CRA frontend
             "total_chunks": result.get("total_chunks"),
             "loan_stats": result.get("loan_stats"),
             "stress_analysis": result.get("stress_analysis"),
@@ -245,6 +263,22 @@ def status(task_id):
         }
 
     return jsonify(response)
+
+
+# ---------------------------------------------------------------------------
+# Loan stats — public endpoint used by dashboard sidebar
+# ---------------------------------------------------------------------------
+
+@app.route("/loan_stats", methods=["GET"])
+def loan_stats_proxy():
+    """Proxy to MCP /loan_stats so the frontend only talks to Flask."""
+    import requests as req
+    mcp_url = os.environ.get("MCP_SERVER_URL", "http://mcp_server:6000")
+    try:
+        r = req.get(f"{mcp_url}/loan_stats", timeout=5)
+        return jsonify(r.json()), r.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 502
 
 
 if __name__ == "__main__":
