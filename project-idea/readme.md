@@ -4,7 +4,7 @@ graph TD
     classDef frontend fill:#61dafb,stroke:#333,stroke-width:2px,color:#000
     classDef backend fill:#4a90e2,stroke:#333,stroke-width:2px,color:#fff
     classDef queue fill:#f39c12,stroke:#333,stroke-width:2px,color:#000
-    classDef ai fill:#9b59b6,stroke:#333,stroke-width:2px,color:#fff
+    classDef ai fill:#9b59b6,stroke:#333,stroke-width:2px,color:#fff 
     classDef data fill:#2ecc71,stroke:#333,stroke-width:2px,color:#000
     %% 1. Client Layer
     subgraph Frontend
